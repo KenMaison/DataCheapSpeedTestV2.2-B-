@@ -526,17 +526,14 @@ measure_upload_bits() {
 }
 
 # --------------------------
-# Quality verdict
+# Quality verdict (no "gaming" text)
 # --------------------------
 quality_verdict() {
-  # Inputs: y_ping_avg y_jitter cf_loss gw_loss gw_ping_avg
   local y_ping="$1" y_jitter="$2" cf_loss="$3" gw_loss="$4" gw_ping="$5"
 
-  # If gateway missing, treat as 0/0 for scoring
   [[ "$gw_loss" == "N/A" ]] && gw_loss="0"
   [[ "$gw_ping" == "N/A" ]] && gw_ping="0"
 
-  # Hard fails (🔴)
   if (( $(echo "$cf_loss >= 2" | bc -l 2>/dev/null || echo 0) )); then
     echo "🔴 Bad|High packet loss to $LOSS_TARGET"
     return
@@ -546,7 +543,6 @@ quality_verdict() {
     return
   fi
 
-  # Warnings (🟡)
   if (( $(echo "$cf_loss > 0" | bc -l 2>/dev/null || echo 0) )); then
     echo "🟡 Warning|Some packet loss detected"
     return
@@ -564,8 +560,7 @@ quality_verdict() {
     return
   fi
 
-  # Great (🟢)
-  echo "🟢 Excellent|Stable connection (gaming/VoIP ready)"
+  echo "🟢 Excellent|Stable connection"
 }
 
 # --------------------------
