@@ -1,0 +1,608 @@
+#!/usr/bin/env bash
+# ============================================================
+# Datacheap
+# Mesheryakov&Romanov
+# ============================================================
+# Datacheap Yandex Speed Test (Beautiful CLI)
+# Ping / Download / Upload via Yandex Internetometer probes
+# + Packet Loss (Cloudflare) + Gateway Ping/Loss (Local diagnostic)
+# Time: Russia (MSK)
+# ============================================================
+
+set -Eeuo pipefail
+
+# --------------------------
+# Colors
+# --------------------------
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+
+RED=$'\033[31m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+BLUE=$'\033[34m'
+MAGENTA=$'\033[35m'
+CYAN=$'\033[36m'
+GRAY=$'\033[90m'
+
+BRIGHT_CYAN=$'\033[96m'
+BRIGHT_GREEN=$'\033[92m'
+BRIGHT_MAGENTA=$'\033[95m'
+
+# --------------------------
+# Settings (override via env)
+# --------------------------
+PING_SAMPLES="${PING_SAMPLES:-10}"
+DOWNLOAD_SECONDS="${DOWNLOAD_SECONDS:-10}"
+UPLOAD_SECONDS="${UPLOAD_SECONDS:-10}"
+
+LOSS_TARGET="${LOSS_TARGET:-1.1.1.1}"       # packet loss target (Cloudflare by default)
+LOSS_PINGS="${LOSS_PINGS:-20}"              # number of pings for loss check
+GATEWAY_PINGS="${GATEWAY_PINGS:-10}"        # number of pings to gateway
+
+PROBES_API="https://yandex.ru/internet/api/v0/get-probes"
+IPV4_API="https://ipv4-internet.yandex.net/api/v0/ip"
+IPV6_API="https://ipv6-internet.yandex.net/api/v0/ip"
+
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+
+DEBUG=false
+for arg in "$@"; do
+  [[ "$arg" == "--debug" ]] && DEBUG=true
+done
+
+TMPDIR_ST="$(mktemp -d /tmp/datacheap_yandex_speedtest.XXXXXX)"
+SPINNER_PID=""
+
+cleanup() {
+  rm -rf "$TMPDIR_ST" 2>/dev/null || true
+  kill "$(jobs -p)" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# --------------------------
+# Time (Russia / MSK)
+# --------------------------
+now_ru() {
+  # Prefer real tz database name; fallback to UTC+3 if tzdata missing
+  if TZ="Europe/Moscow" date '+%Y-%m-%d %H:%M:%S' >/dev/null 2>&1; then
+    TZ="Europe/Moscow" date '+%Y-%m-%d %H:%M:%S MSK'
+  else
+    date -u -d '+3 hour' '+%Y-%m-%d %H:%M:%S MSK' 2>/dev/null \
+      || date -u '+%Y-%m-%d %H:%M:%S UTC'
+  fi
+}
+
+# --------------------------
+# Helpers
+# --------------------------
+color() { local c="$1"; shift; printf "%s%s%s" "$c" "$*" "$RESET"; }
+bold()  { printf "%s%s%s" "$BOLD" "$*" "$RESET"; }
+debug() { $DEBUG && echo "[DEBUG] $*" >&2 || true; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+check_deps() {
+  local missing=()
+  for cmd in curl bc python3 awk sort wc tr sed tput seq ping ip head; do
+    need_cmd "$cmd" || missing+=("$cmd")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    echo "$(color "$RED" "❌ Missing dependencies: ${missing[*]}")"
+    echo "$(color "$YELLOW" "👉 Install: apt install -y ${missing[*]}  (or yum/apk equivalent)")"
+    exit 1
+  fi
+}
+
+fmt() {
+  printf "%.2f" "$(echo "scale=6; $1" | bc 2>/dev/null || echo "0")"
+}
+
+format_speed_bits() {
+  local bps="$1"
+  if (( $(echo "$bps >= 1000000000" | bc -l 2>/dev/null || echo 0) )); then
+    echo "$(fmt "$bps / 1000000000") Gbit/s"
+  elif (( $(echo "$bps >= 1000000" | bc -l 2>/dev/null || echo 0) )); then
+    echo "$(fmt "$bps / 1000000") Mbit/s"
+  elif (( $(echo "$bps >= 1000" | bc -l 2>/dev/null || echo 0) )); then
+    echo "$(fmt "$bps / 1000") Kbit/s"
+  else
+    printf "%.0f bit/s" "$(echo "$bps" | bc 2>/dev/null || echo 0)"
+  fi
+}
+
+term_width() { tput cols 2>/dev/null || echo 72; }
+
+line() {
+  local w; w="$(term_width)"
+  printf "%s\n" "$(color "$BRIGHT_CYAN" "$(printf '═%.0s' $(seq 1 "$w"))")"
+}
+subline() {
+  local w; w="$(term_width)"
+  printf "%s\n" "$(color "$GRAY" "$(printf '─%.0s' $(seq 1 "$w"))")"
+}
+
+strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
+
+center_ansi() {
+  local text="$1"
+  local plain width pad
+  plain="$(printf "%s" "$text" | strip_ansi)"
+  width="$(term_width)"
+  pad=$(( (width - ${#plain}) / 2 ))
+  (( pad < 0 )) && pad=0
+  printf "%*s%s\n" "$pad" "" "$text"
+}
+
+# --------------------------
+# Spinner
+# --------------------------
+start_spinner() {
+  local msg="$1"
+  {
+    local chars='|/-\'
+    local i=0
+    while true; do
+      printf "\r  %s %s " "$(color "$CYAN" "${chars:$i:1}")" "$msg"
+      i=$(( (i + 1) % 4 ))
+      sleep 0.1
+    done
+  } &
+  SPINNER_PID=$!
+}
+
+stop_spinner() {
+  local msg="$1"
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+  fi
+  printf "\r  %s %-40s\n" "$(color "$BRIGHT_GREEN" "✓")" "$msg"
+}
+
+# --------------------------
+# UI
+# --------------------------
+print_banner() {
+  line
+  center_ansi "$(color "$BRIGHT_MAGENTA" "$(bold '🚀 DATACHEAP • SPEED TEST 🚀')")"
+  center_ansi "$(color "$BRIGHT_GREEN"  "$(bold 'Datacheap')")"
+  center_ansi "$(color "$YELLOW"        "$(bold 'Mesheryakov&Romanov')")"
+  center_ansi "$(color "$CYAN" "Yandex Internetometer probes")"
+  line
+  echo
+}
+
+print_meta() {
+  echo "🖥️  $(bold 'System')   : Linux / Bash"
+  echo "🌐 $(bold 'Mode')     : Ping / Download / Upload"
+  echo "🕒 $(bold 'Started')  : $(now_ru)"
+  echo "⚙️  $(bold 'Tuning')   : PING_SAMPLES=$PING_SAMPLES | DL=${DOWNLOAD_SECONDS}s | UL=${UPLOAD_SECONDS}s | LOSS=${LOSS_PINGS}p"
+  subline
+}
+
+# --------------------------
+# Yandex probes fetch + parse
+# --------------------------
+fetch_probes() {
+  local raw
+  raw="$(curl -s --max-time 10 \
+    -H "User-Agent: $UA" \
+    -H "Referer: https://yandex.ru/internet/" \
+    -H "Accept: application/json" \
+    "$PROBES_API" 2>/dev/null || true)"
+
+  [[ -z "$raw" ]] && return 1
+  printf "%s" "$raw" > "$TMPDIR_ST/probes.json"
+
+  TMPDIR_ST="$TMPDIR_ST" python3 <<'PYEOF'
+import json, os
+td = os.environ["TMPDIR_ST"]
+with open(f"{td}/probes.json", "r", encoding="utf-8") as f:
+    d = json.load(f)
+
+with open(f"{td}/ping_urls", "w", encoding="utf-8") as f:
+    for p in d.get("latency", {}).get("probes", []):
+        f.write(p["url"] + "\n")
+
+with open(f"{td}/download_urls", "w", encoding="utf-8") as f:
+    for p in d.get("download", {}).get("probes", []):
+        url = p.get("url","")
+        if "50mb" in url:
+            f.write(url + "\n")
+
+with open(f"{td}/upload_urls", "w", encoding="utf-8") as f:
+    for p in d.get("upload", {}).get("probes", []):
+        url = p.get("url","")
+        if url and "timeout" not in url:
+            f.write(url + "\n")
+
+with open(f"{td}/upload_warmup_urls", "w", encoding="utf-8") as f:
+    warmup = d.get("upload", {}).get("warmup", {})
+    for p in warmup.get("probes", []):
+        urls = p.get("urls", [])
+        if urls:
+            f.write(urls[0] + "\n")
+
+servers = set()
+for section in ["latency", "download", "upload"]:
+    for p in d.get(section, {}).get("probes", []):
+        url = p.get("url","")
+        if url:
+            try:
+                servers.add(url.split("/")[2])
+            except Exception:
+                pass
+
+with open(f"{td}/servers", "w", encoding="utf-8") as f:
+    for s in sorted(servers):
+        f.write(s + "\n")
+PYEOF
+}
+
+print_probe_servers() {
+  local n
+  n="$(wc -l < "$TMPDIR_ST/servers" | tr -d ' ')"
+  echo -e "📡 ${DIM}Probe servers: ${n} Yandex CDN nodes${RESET}"
+  if $DEBUG; then
+    while IFS= read -r s; do
+      [[ -n "$s" ]] && echo -e "   ${DIM}→ ${s}${RESET}"
+    done < "$TMPDIR_ST/servers"
+  fi
+  subline
+}
+
+# --------------------------
+# Connection info
+# --------------------------
+get_connection_info() {
+  local ipv4 ipv6 info parsed city region country org
+  ipv4="$(curl -s --max-time 5 -H "User-Agent: $UA" "$IPV4_API" 2>/dev/null | tr -d '"' || echo "N/A")"
+  ipv6="$(curl -s --max-time 3 -6 -H "User-Agent: $UA" "$IPV6_API" 2>/dev/null | tr -d '"' || true)"
+  info="$(curl -s --max-time 5 "https://ipinfo.io/${ipv4}/json" 2>/dev/null || echo '{}')"
+
+  parsed="$(echo "$info" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('city','')+'|'+d.get('region','')+'|'+d.get('country','')+'|'+d.get('org',''))" 2>/dev/null || echo '|||')"
+  IFS='|' read -r city region country org <<<"$parsed"
+
+  echo "🌍 $(bold 'IPv4')     : $ipv4"
+  if [[ -n "${ipv6:-}" && "$ipv6" != "N/A" ]]; then
+    echo "🌐 $(bold 'IPv6')     : $ipv6"
+  else
+    echo "🌐 $(bold 'IPv6')     : not available"
+  fi
+  [[ -n "$org"  ]] && echo "🏢 $(bold 'ISP')      : $org"
+  [[ -n "$city" ]] && echo "📍 $(bold 'Location') : ${city}${region:+, $region}${country:+, $country}"
+  subline
+}
+
+# --------------------------
+# Packet loss (Cloudflare by default)
+# --------------------------
+measure_packet_loss() {
+  local out loss
+  out="$(ping -c "$LOSS_PINGS" -W 1 "$LOSS_TARGET" 2>/dev/null || true)"
+  loss="$(echo "$out" | awk -F',' '/packet loss/ {
+    gsub(/% packet loss/,"",$3);
+    gsub(/ /,"",$3);
+    print $3
+  }')"
+  [[ -z "$loss" ]] && loss="0"
+  echo "$loss"
+}
+
+# --------------------------
+# Gateway ping/loss (local diagnostic)
+# Output: avg_ms|loss_percent|gateway_ip
+# --------------------------
+measure_gateway_ping() {
+  local gw out avg loss
+  gw="$(ip route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1)"
+  [[ -z "${gw:-}" ]] && { echo "N/A|N/A|N/A"; return; }
+
+  out="$(ping -c "$GATEWAY_PINGS" -W 1 "$gw" 2>/dev/null || true)"
+  avg="$(echo "$out" | awk -F'/' '/rtt|round-trip/ {print $5}')"
+  loss="$(echo "$out" | awk -F',' '/packet loss/ {
+    gsub(/% packet loss/,"",$3);
+    gsub(/ /,"",$3);
+    print $3
+  }')"
+
+  [[ -z "${avg:-}" ]] && avg="0.00"
+  [[ -z "${loss:-}" ]] && loss="0"
+  printf "%s|%s|%s" "$avg" "$loss" "$gw"
+}
+
+# --------------------------
+# Measurements (Yandex)
+# --------------------------
+measure_ping() {
+  local results=()
+
+  while IFS= read -r url; do
+    [[ -z "$url" ]] && continue
+
+    curl -s -o /dev/null -I --max-time 5 \
+      -H "User-Agent: $UA" \
+      -H "Referer: https://yandex.ru/internet/" \
+      "$url" 2>/dev/null || true
+
+    for _ in $(seq 1 "$PING_SAMPLES"); do
+      local timing ts ta ms
+      timing="$(curl -s -o /dev/null \
+        -w "%{time_starttransfer} %{time_appconnect}" \
+        -I --max-time 5 \
+        -H "User-Agent: $UA" \
+        -H "Referer: https://yandex.ru/internet/" \
+        "$url" 2>/dev/null || echo "0 0")"
+
+      ts="$(echo "$timing" | awk '{print $1}')"
+      ta="$(echo "$timing" | awk '{print $2}')"
+
+      ms="$(echo "($ts - $ta) * 1000" | bc 2>/dev/null || echo "0")"
+      if (( $(echo "$ms > 0" | bc -l 2>/dev/null || echo 0) )); then
+        results+=("$ms")
+      fi
+    done
+  done < "$TMPDIR_ST/ping_urls"
+
+  local count="${#results[@]}"
+  if (( count == 0 )); then
+    echo "0.00|0.00|0.00|0.00"
+    return
+  fi
+
+  IFS=$'\n' read -r -d '' -a sorted < <(printf '%s\n' "${results[@]}" | sort -g && printf '\0')
+  local trim=$(( count / 4 ))
+
+  local total=0 min=999999 max=0 trimmed_count=0
+  for idx in $(seq "$trim" $(( count - trim - 1 ))); do
+    local val="${sorted[$idx]}"
+    total="$(echo "$total + $val" | bc)"
+    trimmed_count=$((trimmed_count + 1))
+    (( $(echo "$val < $min" | bc -l) )) && min="$val"
+    (( $(echo "$val > $max" | bc -l) )) && max="$val"
+  done
+
+  if (( trimmed_count == 0 )); then
+    echo "0.00|0.00|0.00|0.00"
+    return
+  fi
+
+  local avg jitter_sum=0 prev=""
+  avg="$(fmt "$total / $trimmed_count")"
+
+  for idx in $(seq "$trim" $(( count - trim - 1 ))); do
+    local val="${sorted[$idx]}"
+    if [[ -n "$prev" ]]; then
+      local diff
+      diff="$(echo "$val - $prev" | bc)"
+      diff="$(echo "${diff#-}" | bc)"
+      jitter_sum="$(echo "$jitter_sum + $diff" | bc)"
+    fi
+    prev="$val"
+  done
+
+  local jitter="0.00"
+  if (( trimmed_count > 1 )); then
+    jitter="$(fmt "$jitter_sum / ($trimmed_count - 1)")"
+  fi
+
+  echo "$avg|$(fmt "$min")|$(fmt "$max")|$jitter"
+}
+
+download_stream() {
+  local url="$1" result_file="$2" duration="$3"
+  local out
+  out="$(curl -s -o /dev/null \
+    -w "%{size_download} %{time_total} %{speed_download}" \
+    --max-time "$duration" \
+    -H "User-Agent: $UA" \
+    -H "Referer: https://yandex.ru/internet/" \
+    "$url" 2>/dev/null || true)"
+  echo "${out:-0 0 0}" > "$result_file"
+}
+
+measure_download_bits() {
+  local idx=0
+  local -a pids=()
+
+  $DEBUG && { debug "download_urls:"; cat "$TMPDIR_ST/download_urls" >&2 || true; }
+
+  while IFS= read -r url; do
+    [[ -z "$url" ]] && continue
+    idx=$((idx + 1))
+    download_stream "$url" "$TMPDIR_ST/dlspeed_$idx" "$DOWNLOAD_SECONDS" &
+    pids+=("$!")
+  done < "$TMPDIR_ST/download_urls"
+
+  for pid in "${pids[@]:-}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  local total_speed=0
+  for f in "$TMPDIR_ST"/dlspeed_*; do
+    [[ -f "$f" ]] || continue
+    local line size t computed
+    line="$(cat "$f" 2>/dev/null || echo "0 0 0")"
+    size="$(awk '{print $1}' <<<"$line")"
+    t="$(awk '{print $2}' <<<"$line")"
+    if [[ -n "$t" ]] && (( $(echo "${t:-0} > 0" | bc -l 2>/dev/null || echo 0) )); then
+      computed="$(echo "scale=0; ${size:-0} / $t" | bc 2>/dev/null || echo 0)"
+    else
+      computed=0
+    fi
+    total_speed="$(echo "$total_speed + ${computed:-0}" | bc)"
+  done
+
+  echo "$(echo "scale=2; $total_speed * 8" | bc)"
+}
+
+upload_warmup() {
+  [[ -s "$TMPDIR_ST/upload_warmup_urls" ]] || return 0
+  local count=0
+  while IFS= read -r url; do
+    [[ -z "$url" ]] && continue
+    count=$((count + 1))
+    (( count > 3 )) && break
+    head -c 51200 /dev/urandom 2>/dev/null | \
+      curl -s -X POST --data-binary @- \
+        -o /dev/null --max-time 3 \
+        -H "User-Agent: $UA" \
+        -H "Referer: https://yandex.ru/internet/" \
+        -H "Content-Type: application/octet-stream" \
+        "$url" 2>/dev/null || true
+  done < "$TMPDIR_ST/upload_warmup_urls"
+}
+
+upload_stream() {
+  local url="$1" result_file="$2" payload="$3" duration="$4"
+  local out
+  out="$(curl -s -X POST --data-binary @"$payload" \
+    -o /dev/null \
+    -w "%{size_upload} %{time_total} %{speed_upload}" \
+    --max-time "$duration" \
+    -H "User-Agent: $UA" \
+    -H "Referer: https://yandex.ru/internet/" \
+    -H "Content-Type: application/octet-stream" \
+    "$url" 2>/dev/null || true)"
+  echo "${out:-0 0 0}" > "$result_file"
+}
+
+measure_upload_bits() {
+  head -c 52428800 /dev/urandom > "$TMPDIR_ST/upload_payload" 2>/dev/null
+  upload_warmup
+
+  local idx=0
+  local -a pids=()
+
+  $DEBUG && { debug "upload_urls:"; cat "$TMPDIR_ST/upload_urls" >&2 || true; }
+
+  while IFS= read -r url; do
+    [[ -z "$url" ]] && continue
+    idx=$((idx + 1))
+    upload_stream "$url" "$TMPDIR_ST/ulspeed_$idx" "$TMPDIR_ST/upload_payload" "$UPLOAD_SECONDS" &
+    pids+=("$!")
+  done < "$TMPDIR_ST/upload_urls"
+
+  for pid in "${pids[@]:-}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  local total_speed=0
+  for f in "$TMPDIR_ST"/ulspeed_*; do
+    [[ -f "$f" ]] || continue
+    local line size t computed
+    line="$(cat "$f" 2>/dev/null || echo "0 0 0")"
+    size="$(awk '{print $1}' <<<"$line")"
+    t="$(awk '{print $2}' <<<"$line")"
+    if [[ -n "$t" ]] && (( $(echo "${t:-0} > 0" | bc -l 2>/dev/null || echo 0) )); then
+      computed="$(echo "scale=0; ${size:-0} / $t" | bc 2>/dev/null || echo 0)"
+    else
+      computed=0
+    fi
+    total_speed="$(echo "$total_speed + ${computed:-0}" | bc)"
+  done
+
+  echo "$(echo "scale=2; $total_speed * 8" | bc)"
+}
+
+# --------------------------
+# Results UI
+# --------------------------
+loss_color() {
+  local loss="${1:-0}"
+  if (( $(echo "$loss <= 0.5" | bc -l 2>/dev/null || echo 0) )); then
+    echo "$BRIGHT_GREEN"
+  elif (( $(echo "$loss <= 2" | bc -l 2>/dev/null || echo 0) )); then
+    echo "$YELLOW"
+  else
+    echo "$RED"
+  fi
+}
+
+print_results() {
+  local ping_data="$1" dl_bits="$2" ul_bits="$3" cf_loss="$4" gw_data="$5"
+  local ping_avg ping_min ping_max jitter
+  IFS='|' read -r ping_avg ping_min ping_max jitter <<<"$ping_data"
+
+  local gw_avg gw_loss gw_ip
+  IFS='|' read -r gw_avg gw_loss gw_ip <<<"$gw_data"
+
+  local cf_c; cf_c="$(loss_color "$cf_loss")"
+  local gw_c; gw_c="$(loss_color "${gw_loss:-0}")"
+
+  echo
+  echo "$(color "$GRAY" "────────────────────────────────────────")"
+  echo "$(bold 'Results')"
+  echo "$(color "$GRAY" "────────────────────────────────────────")"
+  echo
+  echo "⬇️  $(bold 'Download') : $(color "$GREEN" "$(format_speed_bits "$dl_bits")")"
+  echo "⬆️  $(bold 'Upload')   : $(color "$BLUE"  "$(format_speed_bits "$ul_bits")")"
+  echo
+  echo "📶 $(bold 'Yandex Ping') : $(color "$YELLOW" "${ping_avg} ms")"
+  echo "   $(color "$DIM" "min: ${ping_min} ms / max: ${ping_max} ms / jitter: ${jitter} ms")"
+  echo
+  echo "📦 $(bold 'Packet loss') : $(color "$cf_c" "${cf_loss}%")  $(color "$DIM" "(to ${LOSS_TARGET})")"
+  if [[ "${gw_ip:-N/A}" != "N/A" ]]; then
+    echo "🛣️  $(bold 'Gateway')     : $(color "$CYAN" "${gw_ip}")"
+    echo "   $(bold 'GW ping')      : $(color "$CYAN" "${gw_avg} ms")   $(bold 'GW loss'): $(color "$gw_c" "${gw_loss}%")"
+  else
+    echo "🛣️  $(bold 'Gateway')     : $(color "$DIM" "not available")"
+  fi
+  echo
+  echo "$(color "$GRAY" "────────────────────────────────────────")"
+  echo "$(color "$DIM" "Server: Yandex CDN | $(now_ru)")"
+  echo
+}
+
+# --------------------------
+# Main
+# --------------------------
+main() {
+  check_deps
+  print_banner
+  print_meta
+
+  start_spinner "Fetching Yandex probe servers..."
+  if ! fetch_probes; then
+    stop_spinner "Probe fetch failed"
+    echo "$(color "$RED" "❌ Failed to fetch probes from Yandex")"
+    exit 1
+  fi
+  stop_spinner "Probe servers fetched"
+  print_probe_servers
+
+  start_spinner "Getting connection info..."
+  get_connection_info > "$TMPDIR_ST/conn.txt" 2>/dev/null || true
+  stop_spinner "Connection info received"
+  cat "$TMPDIR_ST/conn.txt" || true
+
+  start_spinner "Measuring Yandex ping..."
+  measure_ping > "$TMPDIR_ST/ping.txt"
+  stop_spinner "Ping measured"
+  PING_DATA="$(cat "$TMPDIR_ST/ping.txt")"
+
+  start_spinner "Measuring packet loss (${LOSS_TARGET})..."
+  CF_LOSS="$(measure_packet_loss)"
+  stop_spinner "Packet loss measured"
+
+  start_spinner "Measuring gateway ping/loss..."
+  GW_DATA="$(measure_gateway_ping)"
+  stop_spinner "Gateway measured"
+
+  start_spinner "Testing download speed..."
+  measure_download_bits > "$TMPDIR_ST/dl.txt"
+  stop_spinner "Download measured"
+  DL_BITS="$(cat "$TMPDIR_ST/dl.txt")"
+
+  start_spinner "Testing upload speed..."
+  measure_upload_bits > "$TMPDIR_ST/ul.txt"
+  stop_spinner "Upload measured"
+  UL_BITS="$(cat "$TMPDIR_ST/ul.txt")"
+
+  print_results "$PING_DATA" "$DL_BITS" "$UL_BITS" "$CF_LOSS" "$GW_DATA"
+}
+
+main "$@"
