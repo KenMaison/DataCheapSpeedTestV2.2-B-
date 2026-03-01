@@ -5,7 +5,8 @@
 # ============================================================
 # Datacheap Yandex Speed Test (Beautiful CLI)
 # Ping / Download / Upload via Yandex Internetometer probes
-# + Packet Loss (Cloudflare) + Gateway Ping/Loss (Local diagnostic)
+# + Packet Loss (with X/Y packets) + Gateway diagnostics
+# + Quality Verdict (🟢/🟡/🔴)
 # Time: Russia (MSK)
 # ============================================================
 
@@ -65,7 +66,6 @@ trap cleanup EXIT
 # Time (Russia / MSK)
 # --------------------------
 now_ru() {
-  # Prefer real tz database name; fallback to UTC+3 if tzdata missing
   if TZ="Europe/Moscow" date '+%Y-%m-%d %H:%M:%S' >/dev/null 2>&1; then
     TZ="Europe/Moscow" date '+%Y-%m-%d %H:%M:%S MSK'
   else
@@ -135,6 +135,17 @@ center_ansi() {
   printf "%*s%s\n" "$pad" "" "$text"
 }
 
+loss_color() {
+  local loss="${1:-0}"
+  if (( $(echo "$loss <= 0.5" | bc -l 2>/dev/null || echo 0) )); then
+    echo "$BRIGHT_GREEN"
+  elif (( $(echo "$loss <= 2" | bc -l 2>/dev/null || echo 0) )); then
+    echo "$YELLOW"
+  else
+    echo "$RED"
+  fi
+}
+
 # --------------------------
 # Spinner
 # --------------------------
@@ -179,7 +190,6 @@ print_meta() {
   echo "🖥️  $(bold 'System')   : Linux / Bash"
   echo "🌐 $(bold 'Mode')     : Ping / Download / Upload"
   echo "🕒 $(bold 'Started')  : $(now_ru)"
-  echo "⚙️  $(bold 'Tuning')   : PING_SAMPLES=$PING_SAMPLES | DL=${DOWNLOAD_SECONDS}s | UL=${UPLOAD_SECONDS}s | LOSS=${LOSS_PINGS}p"
   subline
 }
 
@@ -278,18 +288,25 @@ get_connection_info() {
 }
 
 # --------------------------
-# Packet loss (Cloudflare by default)
+# Packet loss (with transmitted/received)
+# Output: loss|tx|rx
 # --------------------------
 measure_packet_loss() {
-  local out loss
+  local out loss tx rx
   out="$(ping -c "$LOSS_PINGS" -W 1 "$LOSS_TARGET" 2>/dev/null || true)"
+
+  tx="$(echo "$out" | awk '/packets transmitted/ {print $1}')"
+  rx="$(echo "$out" | awk '/packets transmitted/ {print $4}')"
   loss="$(echo "$out" | awk -F',' '/packet loss/ {
     gsub(/% packet loss/,"",$3);
     gsub(/ /,"",$3);
     print $3
   }')"
+
+  [[ -z "$tx" ]] && tx="$LOSS_PINGS"
+  [[ -z "$rx" ]] && rx="0"
   [[ -z "$loss" ]] && loss="0"
-  echo "$loss"
+  echo "$loss|$tx|$rx"
 }
 
 # --------------------------
@@ -509,29 +526,70 @@ measure_upload_bits() {
 }
 
 # --------------------------
-# Results UI
+# Quality verdict
 # --------------------------
-loss_color() {
-  local loss="${1:-0}"
-  if (( $(echo "$loss <= 0.5" | bc -l 2>/dev/null || echo 0) )); then
-    echo "$BRIGHT_GREEN"
-  elif (( $(echo "$loss <= 2" | bc -l 2>/dev/null || echo 0) )); then
-    echo "$YELLOW"
-  else
-    echo "$RED"
+quality_verdict() {
+  # Inputs: y_ping_avg y_jitter cf_loss gw_loss gw_ping_avg
+  local y_ping="$1" y_jitter="$2" cf_loss="$3" gw_loss="$4" gw_ping="$5"
+
+  # If gateway missing, treat as 0/0 for scoring
+  [[ "$gw_loss" == "N/A" ]] && gw_loss="0"
+  [[ "$gw_ping" == "N/A" ]] && gw_ping="0"
+
+  # Hard fails (🔴)
+  if (( $(echo "$cf_loss >= 2" | bc -l 2>/dev/null || echo 0) )); then
+    echo "🔴 Bad|High packet loss to $LOSS_TARGET"
+    return
   fi
+  if (( $(echo "$gw_loss >= 1" | bc -l 2>/dev/null || echo 0) )); then
+    echo "🔴 Bad|Packet loss to gateway (local issue)"
+    return
+  fi
+
+  # Warnings (🟡)
+  if (( $(echo "$cf_loss > 0" | bc -l 2>/dev/null || echo 0) )); then
+    echo "🟡 Warning|Some packet loss detected"
+    return
+  fi
+  if (( $(echo "$y_ping >= 60" | bc -l 2>/dev/null || echo 0) )); then
+    echo "🟡 Warning|High latency (ping)"
+    return
+  fi
+  if (( $(echo "$y_jitter >= 10" | bc -l 2>/dev/null || echo 0) )); then
+    echo "🟡 Warning|High jitter"
+    return
+  fi
+  if (( $(echo "$gw_ping >= 5" | bc -l 2>/dev/null || echo 0) )); then
+    echo "🟡 Warning|Gateway latency is elevated"
+    return
+  fi
+
+  # Great (🟢)
+  echo "🟢 Excellent|Stable connection (gaming/VoIP ready)"
 }
 
+# --------------------------
+# Results UI
+# --------------------------
 print_results() {
-  local ping_data="$1" dl_bits="$2" ul_bits="$3" cf_loss="$4" gw_data="$5"
+  local ping_data="$1" dl_bits="$2" ul_bits="$3" cf_loss_data="$4" gw_data="$5"
+
   local ping_avg ping_min ping_max jitter
   IFS='|' read -r ping_avg ping_min ping_max jitter <<<"$ping_data"
 
   local gw_avg gw_loss gw_ip
   IFS='|' read -r gw_avg gw_loss gw_ip <<<"$gw_data"
 
+  local cf_loss cf_tx cf_rx
+  IFS='|' read -r cf_loss cf_tx cf_rx <<<"$cf_loss_data"
+  local cf_lost=$(( cf_tx - cf_rx ))
+
   local cf_c; cf_c="$(loss_color "$cf_loss")"
   local gw_c; gw_c="$(loss_color "${gw_loss:-0}")"
+
+  local verdict_line verdict note
+  verdict_line="$(quality_verdict "$ping_avg" "$jitter" "$cf_loss" "$gw_loss" "$gw_avg")"
+  IFS='|' read -r verdict note <<<"$verdict_line"
 
   echo
   echo "$(color "$GRAY" "────────────────────────────────────────")"
@@ -544,13 +602,17 @@ print_results() {
   echo "📶 $(bold 'Yandex Ping') : $(color "$YELLOW" "${ping_avg} ms")"
   echo "   $(color "$DIM" "min: ${ping_min} ms / max: ${ping_max} ms / jitter: ${jitter} ms")"
   echo
-  echo "📦 $(bold 'Packet loss') : $(color "$cf_c" "${cf_loss}%")  $(color "$DIM" "(to ${LOSS_TARGET})")"
+  echo "📦 $(bold 'Packet loss') : $(color "$cf_c" "${cf_loss}%") (${cf_lost} / ${cf_tx} packets) → ${LOSS_TARGET}"
+
   if [[ "${gw_ip:-N/A}" != "N/A" ]]; then
     echo "🛣️  $(bold 'Gateway')     : $(color "$CYAN" "${gw_ip}")"
     echo "   $(bold 'GW ping')      : $(color "$CYAN" "${gw_avg} ms")   $(bold 'GW loss'): $(color "$gw_c" "${gw_loss}%")"
   else
     echo "🛣️  $(bold 'Gateway')     : $(color "$DIM" "not available")"
   fi
+
+  echo
+  echo "✅ $(bold 'Quality') : $verdict  $(color "$DIM" "— $note")"
   echo
   echo "$(color "$GRAY" "────────────────────────────────────────")"
   echo "$(color "$DIM" "Server: Yandex CDN | $(now_ru)")"
@@ -585,7 +647,7 @@ main() {
   PING_DATA="$(cat "$TMPDIR_ST/ping.txt")"
 
   start_spinner "Measuring packet loss (${LOSS_TARGET})..."
-  CF_LOSS="$(measure_packet_loss)"
+  CF_LOSS_DATA="$(measure_packet_loss)"
   stop_spinner "Packet loss measured"
 
   start_spinner "Measuring gateway ping/loss..."
@@ -602,7 +664,7 @@ main() {
   stop_spinner "Upload measured"
   UL_BITS="$(cat "$TMPDIR_ST/ul.txt")"
 
-  print_results "$PING_DATA" "$DL_BITS" "$UL_BITS" "$CF_LOSS" "$GW_DATA"
+  print_results "$PING_DATA" "$DL_BITS" "$UL_BITS" "$CF_LOSS_DATA" "$GW_DATA"
 }
 
 main "$@"
